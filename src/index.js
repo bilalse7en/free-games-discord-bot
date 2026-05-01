@@ -10,6 +10,14 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const DB_PATH = path.join(__dirname, '../database.json');
 
+const http = require('http');
+
+// Create a small server to keep the bot alive on Render/Koyeb
+http.createServer((req, res) => {
+    res.write("Se7eN Bot is Online! -.^");
+    res.end();
+}).listen(process.env.PORT || 3000);
+
 // Initialize Discord Client
 const client = new Client({
     intents: [
