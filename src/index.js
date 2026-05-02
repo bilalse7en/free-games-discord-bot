@@ -28,6 +28,8 @@ const client = new Client({
     ]
 });
 
+const GUILD_PATH = path.join(__dirname, '../guilds.json');
+
 /**
  * Register Slash Commands
  */
@@ -35,7 +37,11 @@ async function registerCommands() {
     const commands = [
         new SlashCommandBuilder()
             .setName('freegames')
-            .setDescription('Check for current 100% free games on Steam and Epic!')
+            .setDescription('Check for current 100% free games on Steam and Epic!'),
+        new SlashCommandBuilder()
+            .setName('setchannel')
+            .setDescription('Set the current channel for automatic free game updates.')
+            .setDefaultMemberPermissions(0) // Admin only
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -58,7 +64,7 @@ function loadDatabase() {
         const parsed = data ? JSON.parse(data) : [];
         return Array.isArray(parsed) ? parsed.map(id => String(id)) : [];
     } catch (err) { 
-        console.error('❌ Database Load Error:', err.message);
+        console.error('❌ [Se7eN] Database Load Error:', err.message);
         return []; 
     }
 }
@@ -67,8 +73,22 @@ function saveDatabase(ids) {
     try { 
         fs.writeFileSync(DB_PATH, JSON.stringify(ids, null, 2)); 
     } catch (err) { 
-        console.error('❌ Database Save Error:', err.message);
+        console.error('❌ [Se7eN] Database Save Error:', err.message);
     }
+}
+
+function loadGuilds() {
+    try {
+        if (!fs.existsSync(GUILD_PATH)) return {};
+        const data = fs.readFileSync(GUILD_PATH, 'utf8');
+        return data ? JSON.parse(data) : {};
+    } catch (err) { return {}; }
+}
+
+function saveGuilds(guilds) {
+    try {
+        fs.writeFileSync(GUILD_PATH, JSON.stringify(guilds, null, 2));
+    } catch (err) { }
 }
 
 /**
@@ -103,58 +123,71 @@ function createGameEmbed(game) {
  * Logic to check and post games
  */
 async function checkAndPostGames(forceChannelId = null) {
-    const targetChannelId = forceChannelId || CHANNEL_ID;
-    if (!targetChannelId || targetChannelId === 'YOUR_CHANNEL_ID_HERE') {
-        console.warn('⚠️ No CHANNEL_ID configured. Skipping update.');
-        return;
-    }
-
     console.log(`🔍 [${new Date().toLocaleTimeString()}] Checking for games...`);
     
     const steamGames = await fetchFreeSteamGames();
     const epicGames = await fetchFreeEpicGames();
     
     const seenIds = loadDatabase();
+    const guilds = loadGuilds();
+    
+    // Determine which channels to post to
+    let targetChannelIds = [];
+    if (forceChannelId) {
+        targetChannelIds = [forceChannelId];
+    } else {
+        // Collect all unique channel IDs from all guilds
+        targetChannelIds = Object.values(guilds);
+        // Also include the default CHANNEL_ID if it's not already there
+        if (CHANNEL_ID && !targetChannelIds.includes(CHANNEL_ID)) {
+            targetChannelIds.push(CHANNEL_ID);
+        }
+    }
+
+    if (targetChannelIds.length === 0) {
+        console.warn('⚠️ No channels configured for updates.');
+        return { steamCount: 0, epicCount: 0 };
+    }
+
     let totalPosted = 0;
+    const currentSteamCount = steamGames.length;
+    const currentEpicCount = epicGames.length;
 
     const processStore = async (games, storeLabel) => {
-        // Create a unique slug for each game to prevent duplicates even if IDs differ across APIs
         const getSlug = (game) => `${storeLabel.toLowerCase()}-${game.title.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
 
-        // Filter out games we've already seen
+        // Filter out games we've already seen (unless forced)
         const gamesToPost = forceChannelId ? games : games.filter(game => {
             const slug = getSlug(game);
-            // Check both the new slug and the old ID (for backward compatibility)
             return !seenIds.includes(slug) && !seenIds.includes(String(game.id));
         });
         
         if (gamesToPost.length === 0) return 0;
 
-        const channel = await client.channels.fetch(targetChannelId).catch(() => null);
-        if (!channel) {
-            console.error(`❌ [Se7eN] Could not find channel with ID: ${targetChannelId}`);
-            return 0;
-        }
-
-        console.log(`📢 [Se7eN] Posting ${gamesToPost.length} new ${storeLabel} games...`);
-
         for (const game of gamesToPost) {
             const embed = createGameEmbed(game);
             const slug = getSlug(game);
             
-            // Professional header with emojis
             const storeEmoji = storeLabel === 'Steam' ? '🎮' : '🚀';
             const header = `## ${storeEmoji} ${storeLabel} New Free Game`;
             const alert = forceChannelId ? "" : `\n🔥 **New 100% FREE Alert!** @everyone`;
 
-            await channel.send({ 
-                content: `${header}${alert}`,
-                embeds: [embed] 
-            }).catch(err => console.error(`❌ [Se7eN] Error sending message:`, err.message));
-
-            if (!seenIds.includes(slug)) {
-                seenIds.push(slug);
+            // Post to every target channel
+            for (const channelId of targetChannelIds) {
+                try {
+                    const channel = await client.channels.fetch(channelId).catch(() => null);
+                    if (channel) {
+                        await channel.send({ 
+                            content: `${header}${alert}`,
+                            embeds: [embed] 
+                        });
+                    }
+                } catch (err) {
+                    console.error(`❌ [Se7eN] Error sending to channel ${channelId}:`, err.message);
+                }
             }
+
+            if (!seenIds.includes(slug)) seenIds.push(slug);
             totalPosted++;
         }
         return gamesToPost.length;
@@ -163,32 +196,31 @@ async function checkAndPostGames(forceChannelId = null) {
     const steamCount = await processStore(steamGames, 'Steam');
     const epicCount = await processStore(epicGames, 'Epic Games');
 
-    if (totalPosted > 0) {
-        saveDatabase(seenIds);
-    }
+    if (totalPosted > 0) saveDatabase(seenIds);
 
-    return { steamCount, epicCount };
+    return { steamCount: forceChannelId ? currentSteamCount : steamCount, epicCount: forceChannelId ? currentEpicCount : epicCount };
 }
 
 // Event: Interaction (Slash Commands)
 client.on(Events.InteractionCreate, async interaction => {
-    console.log(`📩 Received interaction: ${interaction.commandName} from ${interaction.user.tag}`);
     if (!interaction.isChatInputCommand()) return;
     
     if (interaction.commandName === 'freegames') {
-        try {
-            await interaction.deferReply();
-            const result = await checkAndPostGames(interaction.channelId);
-            
-            if (!result || (result.steamCount === 0 && result.epicCount === 0)) {
-                await interaction.editReply('No 100% free games found on Steam or Epic right now. 🛍️');
-            } else {
-                await interaction.editReply(`Found ${result.steamCount} Steam and ${result.epicCount} Epic games! 🔥`);
-            }
-        } catch (err) {
-            console.error('❌ Interaction Error:', err);
-            if (interaction.deferred) await interaction.editReply('An error occurred while checking for games.').catch(() => {});
+        await interaction.deferReply();
+        const result = await checkAndPostGames(interaction.channelId);
+        
+        if (result.steamCount === 0 && result.epicCount === 0) {
+            await interaction.editReply('No 100% free games found right now. 🛍️');
+        } else {
+            await interaction.editReply(`Found ${result.steamCount} Steam and ${result.epicCount} Epic games! 🔥`);
         }
+    }
+
+    if (interaction.commandName === 'setchannel') {
+        const guilds = loadGuilds();
+        guilds[interaction.guildId] = interaction.channelId;
+        saveGuilds(guilds);
+        await interaction.reply(`✅ **Se7eN Free Games Alert** will now post updates to this channel!`);
     }
 });
 
